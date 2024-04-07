@@ -16,6 +16,8 @@ from torch.autograd import Variable
 
 from util import *
 
+## to merge
+
 def sample_gumbel(shape, tt=torch, eps=1e-20):
     U = Variable(tt.FloatTensor(shape).uniform_(0, 1))
     return -torch.log(-torch.log(U + eps) + eps)
