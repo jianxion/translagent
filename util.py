@@ -179,8 +179,36 @@ def print_loss(epoch, alpha, avg_loss_dict, mode="train"):
             prt_msg += "% |"
     return prt_msg
 
+import json
+
+def get_idx_to_cat(language_code):
+    """
+    Load a dictionary mapping indices to category labels for a specified language.
+
+    Args:
+    language_code (str): A two-letter code representing the language (e.g., 'en' for English, 'de' for German).
+
+    Returns:
+    dict: A dictionary where keys are indices (as integers) and values are category labels.
+    """
+    file_path = f"{language_code}_categories.json"  # Path to the JSON file
+    try:
+        with open(file_path, 'r') as file:
+            category_dict = json.load(file)
+        # Convert keys to integers
+        return {int(k): v for k, v in category_dict.items()}
+    except FileNotFoundError:
+        print(f"Error: The file '{file_path}' does not exist.")
+        return {}
+    except json.JSONDecodeError:
+        print(f"Error: The file '{file_path}' is not a valid JSON.")
+        return {}
+
+
+
+
 def bergsma_words(lang):
-    words = open('/Users/jianxiongshen/Downloads/eecs692/translagent/data/word/bergsma_public/Share/Lexicons/500/pictureWords.{}'.format(lang)).readlines()
+    words = open('/Users/jianxiongshen/Downloads/eecs692/myproj/data/word/pictureWords.{}'.format(lang)).readlines()
     words = [x.strip() for x in words if x.strip() != ""]
     words = [x.split("\t") for x in words]
     words = [words[key][1] for key in range(len(words))]

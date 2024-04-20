@@ -21,7 +21,7 @@ def gumbel_softmax_sample(logits, temp, tt=torch):
     return F.softmax(y)
 
 def gumbel_softmax(logits, temp, hard, tt=torch):
-    y = gumbel_softmax_sample(logits, temp, tt) # (batch_size, num_cat)
+    y = gumbel_softmax_sample(logits, temp, tt) # (batch_size, num_cat = 468)
     y_max, y_max_idx = torch.max(y, 1, keepdim=True)
     if hard:
         y_hard = tt.FloatTensor(y.size()).zero_().scatter_(1, y_max_idx.data, 1)
@@ -46,7 +46,7 @@ class TwoAgents(torch.nn.Module):
 
     def forward(self, data1, data2):
         a_spk_img, b_lsn_imgs = data1 # spk_imgs : (batch_size, 2048)
-        b_spk_img, a_lsn_imgs = data2 # lsn_imgs : (batch_size, num_dist, 2048)
+        b_spk_img, a_lsn_imgs = data2 # lsn_imgs : (batch_size, num_dist = 2, 2048)
         spk_inputs = [a_spk_img, b_spk_img] # [a, b]
         spk_outputs = [] # [a, b] logits
         lsn_inputs = [a_lsn_imgs, b_lsn_imgs] # [a, b]
@@ -76,9 +76,9 @@ class TwoAgents(torch.nn.Module):
         ##### Listener #####
         for agent, comm_onehot, lsn_imgs in zip(self.agents, comm_onehots, lsn_inputs):
             # lsn_imgs : (batch_size, num_dist, 2048)
-            lsn_imgs = lsn_imgs.view(-1, self.D_img) # (batch_size * num_dist, D_img)
+            lsn_imgs = lsn_imgs.view(-1, self.D_img) # (batch_size * num_dist, D_img = 2048)
             lsn_h_imgs = agent.beholder2(lsn_imgs) if self.no_share_bhd else agent.beholder(lsn_imgs)
-            lsn_h_imgs = lsn_h_imgs.view(-1, num_dist, self.D_hid) # (batch_size, num_dist, D_hig)
+            lsn_h_imgs = lsn_h_imgs.view(-1, num_dist, self.D_hid) # (batch_size, num_dist, D_hid)
 
             lsn_dot = agent.listener(lsn_h_imgs, comm_onehot) # (batch_size, num_dist)
             lsn_outputs.append(lsn_dot)
@@ -86,36 +86,28 @@ class TwoAgents(torch.nn.Module):
         return (spk_outputs[0], lsn_outputs[1]), (spk_outputs[1], lsn_outputs[0]), comm_actions
 
     def translate_from_en(self, sample=False, print_neighbours=False):
-        l1_dic = get_idx_to_cat(args.l1) 
-        l2_dic = get_idx_to_cat(args.l2)
-        assert (len(l1_dic) == self.num_cat) and (len(l2_dic) == self.num_cat)
+        l1_dic = get_idx_to_cat(self.l1) 
+        l2_dic = get_idx_to_cat(self.l2)
 
-        result = { 1:{1:[],0:[]}, 0:{1:[],0:[]}  }
+        # Debug: Print dictionary stats and types
+        print("Some keys in l1_dic:", list(l1_dic.keys())[:5])
+        print("Key types in l1_dic:", type(next(iter(l1_dic.keys()))))
+        print("Some keys in l2_dic:", list(l2_dic.keys())[:5])
+        print("Key types in l2_dic:", type(next(iter(l2_dic.keys()))))
 
-        batch_size = 640
-        #keys = np.random.randint(0, self.num_cat, size=batch_size)
-        keys = np.arange(0, self.num_cat)
+        result = {1: {1: [], 0: []}, 0: {1: [], 0: []}}
+        batch_size = 468
+        keys = np.arange(1, self.num_cat + 1)
         labels = torch.LongTensor(keys).view(batch_size, 1)
 
-        onehot1 = torch.FloatTensor(batch_size, self.num_cat)
-        onehot1.zero_()
-        onehot1.scatter_(1, labels, 1)
-        # onehot1 = Variable(onehot1, requires_grad=False).cuda()
+        onehot1 = torch.FloatTensor(batch_size, self.num_cat).zero_()
+        onehot1.scatter_(1, labels - 1, 1)
         onehot1 = Variable(onehot1, requires_grad=False)
 
-        if sample:
-            logits1 = self.agent2.translate(onehot1)
-            onehot2, idx2 = sample_logit_to_onehot(logits1)
-
-            logits2 = self.agent1.translate(onehot2)
-            onehot3, idx3 = sample_logit_to_onehot(logits2)
-
-        else:
-            logits1 = self.agent2.translate(onehot1)
-            onehot2, idx2 = max_logit_to_onehot(logits1)
-
-            logits2 = self.agent1.translate(onehot2)
-            onehot3, idx3 = max_logit_to_onehot(logits2)
+        logits1 = self.agent2.translate(onehot1)
+        onehot2, idx2 = sample_logit_to_onehot(logits1) if sample else max_logit_to_onehot(logits1)
+        logits2 = self.agent1.translate(onehot2)
+        onehot3, idx3 = sample_logit_to_onehot(logits2) if sample else max_logit_to_onehot(logits2)
 
         _, indices1 = torch.sort(logits1, 1, descending=True)
         _, indices2 = torch.sort(logits2, 1, descending=True)
@@ -123,30 +115,41 @@ class TwoAgents(torch.nn.Module):
         indices2 = indices2.cpu().data.numpy()
 
         for idx in range(labels.nelement()):
-            #print u"{:>25} -> {:>25} -> {:>25}".format(l1_dic[labels[idx][0]], l2_dic[idx2[idx][0]], l1_dic[idx3[idx][0]])
+            label_idx = labels[idx][0].item()
+            if label_idx not in l1_dic:
+                print(f"Label index {label_idx} not in l1_dic")
+                continue
+
             if print_neighbours:
                 for k in range(5):
-                    print (u"{:>25} -> {:>25}".format(l1_dic[labels[idx][0]], l2_dic[indices1[idx][k]]))
-                for k in range(5):
-                    print (u"{:>25}    {:>25} -> {:>25}".format("", l2_dic[idx2[idx][0]], l1_dic[indices2[idx][k]]))
+                    k_index = indices1[idx][k].item()
+                    if k_index not in l2_dic:
+                        print(f"Index {k_index} not in l2_dic")
+                        continue
+                    print("{:>25} -> {:>25}".format(l1_dic[label_idx], l2_dic[k_index]))
 
-            if labels[idx][0] == idx2[idx][0]:
-                right1 =1
-            else:
-                right1= 0
+            right1 = right2 = 0
+            idx2_item = idx2[idx][0].item()
+            idx3_item = idx3[idx][0].item()
+            if label_idx == idx2_item and idx2_item in l2_dic:
+                right1 = 1
+            if label_idx == idx3_item and idx3_item in l1_dic:
+                right2 = 1
 
-            if labels[idx][0] == idx3[idx][0]:
-                right2 =1
-            else:
-                right2= 0
-            result[right1][right2].append( (l1_dic[labels[idx][0]], l2_dic[idx2[idx][0]], l1_dic[idx3[idx][0]]) )
+            result[right1][right2].append((l1_dic[label_idx], l2_dic.get(idx2_item, 'Unknown'), l1_dic.get(idx3_item, 'Unknown')))
+
             if right2 == 0 or right1 == 0:
-                print (right1, right2)
+                print(right1, right2)
                 for k in range(5):
-                    print (u"{:>25} -> {:>25}".format(l1_dic[labels[idx][0]], l2_dic[indices1[idx][k]]))
-                for k in range(5):
-                    print (u"{:>25}    {:>25} -> {:>25}".format("", l2_dic[idx2[idx][0]], l1_dic[indices2[idx][k]]))
+                    k_index = indices1[idx][k].item()
+                    if k_index not in l2_dic:
+                        print(f"Index {k_index} not in l2_dic")
+                        continue
+                    print("{:>25} -> {:>25}".format(l1_dic[label_idx], l2_dic[k_index]))
+
         return result
+
+
 
     def en2de(self, onehot):
         logits = self.agent2.translate(onehot)
@@ -263,6 +266,7 @@ class Speaker(torch.nn.Module):
         comm_onehot, comm_label = gumbel_softmax(spk_logits, temp=self.temp, hard=self.hard, tt=self.tt) # (batch_size, num_cat)
         logits_grad = spk_logits.grad
         output_grad = comm_onehot.grad
+        # print(self.num_cat) = 468
         return spk_logits, comm_onehot, comm_label
 
     def nn_words(self, batch_size = 5):
@@ -290,7 +294,7 @@ class Speaker(torch.nn.Module):
         logits_sorted, indices = torch.sort(ans, dim=0, descending=True)
         indices = indices[:5].cpu().numpy()
 
-        print (u"{} -> {}".format(l1_dic[idx].decode('utf8'), u", ".join([u"{} ({})".format(l1_dic[idx1].decode('utf-8'), "{:0.2f}".format(ans[idx1])) for idx1 in indices])))
+        print ("{} -> {}".format(l1_dic[idx], ", ".join(["{} ({:.2f})".format(l1_dic[idx1], ans[idx1]) for idx1 in indices])))
 
 class Listener(torch.nn.Module):
     def __init__(self, native, foreign, D_hid, num_cat, dropout):
@@ -342,5 +346,5 @@ class Listener(torch.nn.Module):
         logits_sorted, indices = torch.sort(ans, dim=0, descending=True)
         indices = indices[:5].cpu().numpy()
 
-        print (u"{} -> {}".format(l1_dic[idx].decode('utf-8'), u", ".join([u"{} ({})".format(l1_dic[idx1].decode('utf-8'), "{:0.2f}".format(ans[idx1])) for idx1 in indices])))
+        print ("{} -> {}".format(l1_dic[idx], ", ".join(["{} ({:.2f})".format(l1_dic[idx1], ans[idx1]) for idx1 in indices])))
 

@@ -201,7 +201,9 @@ if __name__ == '__main__':
 
         if epoch % args.translate_every == 0:
             model.agent2.listener.nn_words(batch_size=20)
-            #result = model.precision(in_keys, args.batch_size)
+            result = model.precision(in_keys, args.batch_size)
+            result2 = model.translate_from_en(sample=False, print_neighbours=True)
+
             #out_data['translate']['x'].append(epoch)
             #out_data['translate']['y'].append(result)
 
