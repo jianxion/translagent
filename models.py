@@ -1,5 +1,14 @@
+# Copyright (c) 2017-present, Facebook, Inc.
+# All rights reserved.
+#
+# This source code is licensed under the license found in the
+# LICENSE file in the root directory of this source tree.
+#
+
+import operator
 import math
 import sys
+import os
 import pickle as pkl
 import numpy as np
 
@@ -10,7 +19,9 @@ from torch.autograd import Variable
 
 from util import *
 
-# initial commit
+millis = int(round(time.time() * 1000))
+torch.manual_seed(millis)
+torch.cuda.manual_seed(millis)
 
 def sample_gumbel(shape, tt=torch, eps=1e-20):
     U = Variable(tt.FloatTensor(shape).uniform_(0, 1))
@@ -21,7 +32,7 @@ def gumbel_softmax_sample(logits, temp, tt=torch):
     return F.softmax(y)
 
 def gumbel_softmax(logits, temp, hard, tt=torch):
-    y = gumbel_softmax_sample(logits, temp, tt) # (batch_size, num_cat = 468)
+    y = gumbel_softmax_sample(logits, temp, tt) # (batch_size, num_cat)
     y_max, y_max_idx = torch.max(y, 1, keepdim=True)
     if hard:
         y_hard = tt.FloatTensor(y.size()).zero_().scatter_(1, y_max_idx.data, 1)
@@ -29,322 +40,468 @@ def gumbel_softmax(logits, temp, hard, tt=torch):
 
     return y, y_max_idx
 
+class NakaAgent(torch.nn.Module):
+    def __init__(self, native, foreign, args):
+        super(NakaAgent, self).__init__()
+        if args.no_share_bhd:
+            print ("Not sharing visual system for each agent.")
+            self.beholder1 = Beholder(args)
+            self.beholder2 = Beholder(args)
+        else:
+            print ("Sharing visual system for each agent.")
+            self.beholder  = Beholder(args)
+
+        self.decoder_trg = Speaker(native, args)
+        self.encoder_src = RnnListener(foreign, args)
+        if args.train_enc_how == "three":
+            self.encoder_trg = RnnListener(native, args)
+
+        self.tt = torch if args.cpu else torch.cuda
+        self.native, self.foreign = native, foreign
+        self.i2w, self.w2i = args.i2w, args.w2i
+        self.unit_norm = args.unit_norm
+
+        self.D_hid = args.D_hid
+
+        self.beam_width = args.beam_width
+        self.norm_pow = args.norm_pow
+
+    def forward(self):
+        return
+
+    def translate(self, src, decode_how="beam"):
+        # src : (batch_size, seq_len)
+        batch_size = len(src)
+        src_lens = [len(src_i) for src_i in src]
+        seq_len = max(src_lens)
+
+        src = np.array( [ np.lib.pad( src_i, (0, seq_len - len(src_i) ), 'constant', constant_values=(0,0) ) for src_i in src ] )
+        src = Variable( self.tt.LongTensor( src ), requires_grad=False ) # (batch_size, seq_len)
+
+        concept = self.encoder_src(src, src_lens) # (batch_size, D_hid)
+        if self.unit_norm:
+            norm = torch.norm(concept, 2, 1, keepdim=True).expand_as(concept).detach() + 1e-9
+            concept = concept / norm
+
+        if decode_how == "beam":
+            gen_idx = self.decoder_trg.beam_search(concept, self.beam_width, self.norm_pow)
+        elif decode_how == "greedy":
+            gen_idx = self.decoder_trg.sample(concept, True)
+
+        trg = decode(gen_idx, self.i2w[self.native])
+        return trg
+
+class NMT(torch.nn.Module):
+    def __init__(self, src, trg, args):
+        # vocab_size, num_layers, num_directions, i2w, w2i : 2 separate arguments
+        super(NMT, self).__init__()
+
+        self.decoder = Speaker(trg, args)
+        self.encoder = RnnListener(src, args)
+
+        self.tt = torch if args.cpu else torch.cuda
+        self.trg, self.src = trg, src
+        self.i2w, self.w2i = args.i2w, args.w2i
+
+        self.D_hid = args.D_hid
+
+        self.beam_width = args.beam_width
+        self.norm_pow = args.norm_pow
+
+    def forward(self, src_caps_in, src_caps_in_lens, trg_sorted_idx, trg_caps_in, trg_caps_in_lens):
+        enc_hid = self.encoder(src_caps_in, src_caps_in_lens) # (batch_size, D_hid)
+        enc_hid = torch.index_select(enc_hid, 0, trg_sorted_idx)
+        dec_logits, _ = self.decoder(enc_hid, trg_caps_in, trg_caps_in_lens, "argmax")
+        return dec_logits
+
+    def translate(self, src, args):
+        # src : (batch_size, seq_len)
+        batch_size = len(src)
+        src_lens = [len(src_i) for src_i in src]
+        seq_len = max(src_lens)
+
+        src = np.array( [ np.lib.pad( src_i, (0, seq_len - len(src_i) ), 'constant', constant_values=(0,0) ) for src_i in src ] )
+        src = Variable( self.tt.LongTensor( src ), requires_grad=False ) # (batch_size, seq_len)
+
+        concept = self.encoder(src, src_lens) # (batch_size, D_hid)
+
+        if args.decode_how == "beam":
+            gen_idx = self.decoder.beam_search(concept, args.beam_width, args.norm_pow)
+        elif args.decode_how == "greedy":
+            gen_idx = self.decoder.sample(concept, True)
+
+        trg = decode(gen_idx, self.i2w[self.trg])
+        return trg
+
 class TwoAgents(torch.nn.Module):
     def __init__(self, args):
         super(TwoAgents, self).__init__()
-        self.agent1 = Agent(args.l1, args.l2, args)
-        self.agent2 = Agent(args.l2, args.l1, args)
+        self.en_agent = Agent('en', args.l2, args)
+        self.l2_agent = Agent(args.l2, 'en', args)
 
-        self.agents = [self.agent1, self.agent2]
-        self.num_cat = args.num_cat
+        self.agents = [self.en_agent, self.l2_agent]
         self.no_share_bhd = args.no_share_bhd
-        self.train_how = args.train_how
         self.D_img = args.D_img
         self.D_hid = args.D_hid
-        self.l1 = args.l1
-        self.l2 = args.l2
 
-    def forward(self, data1, data2):
-        a_spk_img, b_lsn_imgs = data1 # spk_imgs : (batch_size, 2048)
-        b_spk_img, a_lsn_imgs = data2 # lsn_imgs : (batch_size, num_dist = 2, 2048)
+    def forward(self, data1, data2, spk_sample_how):
+        a_spk_img, b_lsn_imgs, a_spk_caps_in, a_spk_cap_lens = data1 # spk_imgs : (batch_size, 2048)
+        b_spk_img, a_lsn_imgs, b_spk_caps_in, b_spk_cap_lens = data2 # lsn_imgs : (batch_size, num_dist, 2048)
         spk_inputs = [a_spk_img, b_spk_img] # [a, b]
+        spk_caps_ins = [a_spk_caps_in, b_spk_caps_in] # [a, b]
+        spk_cap_lens = [a_spk_cap_lens, b_spk_cap_lens] # [a, b]
         spk_outputs = [] # [a, b] logits
+
         lsn_inputs = [a_lsn_imgs, b_lsn_imgs] # [a, b]
         lsn_outputs = [] # [a, b]
-        comm_onehots = [] # [a, b]
+
         comm_actions = []
         num_dist = b_lsn_imgs.size()[1]
 
         ##### Speaker #####
-        for agent, spk_img in zip(self.agents, spk_inputs): # [a, b]
-            spk_h_img = spk_img
-            spk_h_img = agent.beholder1(spk_h_img) if self.no_share_bhd else agent.beholder(spk_h_img)
+        for agent, spk_input, spk_cap_in, spk_cap_len in zip(self.agents, spk_inputs, spk_caps_ins, spk_cap_lens): # [a, b]
+            if self.no_share_bhd:
+                spk_h_img = agent.beholder1(spk_input) # shared
+            else:
+                spk_h_img = agent.beholder(spk_input) # shared
 
-            spk_logits, comm_onehot, comm_action = agent.speaker(spk_h_img)
+            spk_logits, comm_action = agent.speaker(spk_h_img, spk_cap_in, spk_cap_len, spk_sample_how) # NOTE argmax / gumbel
             spk_outputs.append(spk_logits)
-            # spk_logits : (batch_size, num_cat)
-            # comm_onehot : (batch_size, num_cat)
-            # comm_action : (batch_size)
-
-            # comm_onehots.append(comm_onehot.cuda())
-            # comm_actions.append(comm_action.cuda())
-            comm_onehots.append(comm_onehot)
             comm_actions.append(comm_action)
 
-        comm_onehots = comm_onehots[::-1] # [b, a]
+        comm_actions = comm_actions[::-1] # [b, a]
 
         ##### Listener #####
-        for agent, comm_onehot, lsn_imgs in zip(self.agents, comm_onehots, lsn_inputs):
-            # lsn_imgs : (batch_size, num_dist, 2048)
-            lsn_imgs = lsn_imgs.view(-1, self.D_img) # (batch_size * num_dist, D_img = 2048)
-            lsn_h_imgs = agent.beholder2(lsn_imgs) if self.no_share_bhd else agent.beholder(lsn_imgs)
-            lsn_h_imgs = lsn_h_imgs.view(-1, num_dist, self.D_hid) # (batch_size, num_dist, D_hid)
+        for agent, lsn_imgs, comm, spk_cap_len in zip(self.agents, lsn_inputs, comm_actions, spk_cap_lens):
+            lsn_imgs = lsn_imgs.view(-1, self.D_img)
+            if self.no_share_bhd:
+                lsn_h_imgs = agent.beholder2(lsn_imgs)
+            else:
+                lsn_h_imgs = agent.beholder(lsn_imgs)
+            lsn_h_imgs = lsn_h_imgs.view(-1, num_dist, self.D_hid)
 
-            lsn_dot = agent.listener(lsn_h_imgs, comm_onehot) # (batch_size, num_dist)
-            lsn_outputs.append(lsn_dot)
+            rnn_hid = agent.listener(comm[:,:-1], spk_cap_len-1)
+            rnn_hid = rnn_hid.unsqueeze(1).repeat(1, num_dist, 1) # (batch_size, num_dist, D_hid)
+
+            lsn_outputs.append( (rnn_hid, lsn_h_imgs) )
 
         return (spk_outputs[0], lsn_outputs[1]), (spk_outputs[1], lsn_outputs[0]), comm_actions
 
-    def translate_from_en(self, sample=False, print_neighbours=False):
-        l1_dic = get_idx_to_cat(self.l1) 
-        l2_dic = get_idx_to_cat(self.l2)
+    def en2l2(self, src):
+        trg = self.en_agent.translate(src)
+        return trg
 
-        # Debug: Print dictionary stats and types
-        print("Some keys in l1_dic:", list(l1_dic.keys())[:5])
-        print("Key types in l1_dic:", type(next(iter(l1_dic.keys()))))
-        print("Some keys in l2_dic:", list(l2_dic.keys())[:5])
-        print("Key types in l2_dic:", type(next(iter(l2_dic.keys()))))
-
-        result = {1: {1: [], 0: []}, 0: {1: [], 0: []}}
-        batch_size = 468
-        keys = np.arange(1, self.num_cat + 1)
-        labels = torch.LongTensor(keys).view(batch_size, 1)
-
-        onehot1 = torch.FloatTensor(batch_size, self.num_cat).zero_()
-        onehot1.scatter_(1, labels - 1, 1)
-        onehot1 = Variable(onehot1, requires_grad=False)
-
-        logits1 = self.agent2.translate(onehot1)
-        onehot2, idx2 = sample_logit_to_onehot(logits1) if sample else max_logit_to_onehot(logits1)
-        logits2 = self.agent1.translate(onehot2)
-        onehot3, idx3 = sample_logit_to_onehot(logits2) if sample else max_logit_to_onehot(logits2)
-
-        _, indices1 = torch.sort(logits1, 1, descending=True)
-        _, indices2 = torch.sort(logits2, 1, descending=True)
-        indices1 = indices1.cpu().data.numpy()
-        indices2 = indices2.cpu().data.numpy()
-
-        for idx in range(labels.nelement()):
-            label_idx = labels[idx][0].item()
-            if label_idx not in l1_dic:
-                print(f"Label index {label_idx} not in l1_dic")
-                continue
-
-            if print_neighbours:
-                for k in range(5):
-                    k_index = indices1[idx][k].item()
-                    if k_index not in l2_dic:
-                        print(f"Index {k_index} not in l2_dic")
-                        continue
-                    print("{:>25} -> {:>25}".format(l1_dic[label_idx], l2_dic[k_index]))
-
-            right1 = right2 = 0
-            idx2_item = idx2[idx][0].item()
-            idx3_item = idx3[idx][0].item()
-            if label_idx == idx2_item and idx2_item in l2_dic:
-                right1 = 1
-            if label_idx == idx3_item and idx3_item in l1_dic:
-                right2 = 1
-
-            result[right1][right2].append((l1_dic[label_idx], l2_dic.get(idx2_item, 'Unknown'), l1_dic.get(idx3_item, 'Unknown')))
-
-            if right2 == 0 or right1 == 0:
-                print(right1, right2)
-                for k in range(5):
-                    k_index = indices1[idx][k].item()
-                    if k_index not in l2_dic:
-                        print(f"Index {k_index} not in l2_dic")
-                        continue
-                    print("{:>25} -> {:>25}".format(l1_dic[label_idx], l2_dic[k_index]))
-
-        return result
-
-
-
-    def en2de(self, onehot):
-        logits = self.agent2.translate(onehot)
-        return logits
-
-    def de2en(self, onehot):
-        logits = self.agent1.translate(onehot)
-        return logits
-
-    def en2de2en(self, onehot):
-        logits1 = self.agent2.translate(onehot)
-        onehot2, _ = max_logit_to_onehot(logits1)
-        logits2 = self.agent1.translate(onehot2)
-        return logits2
-
-    def precision(self, keys, bs):
-        ks = [1, 5, 20]
-        result = []
-        rounds = ["{}->{} (agent2/{}) ".format(self.l1, self.l2, self.l2),
-                  "{}->{} (agent1/{}) ".format(self.l2, self.l1, self.l1),
-                  "{}->{}->{} (agent2/{}->agent1/{}) ".format(self.l1, self.l2, self.l1, self.l2, self.l1)]
-
-        for which_round, round_ in enumerate(rounds):
-            acc = [[0,0] for x in range(len(ks))]
-            cnt = 0
-            for batch_idx in range(int(math.ceil( float(len(keys)) / bs ) ) ):
-                labels_ = np.arange(batch_idx * bs , min(len(keys), (batch_idx+1) * bs ) )
-                labels_ = keys[labels_]
-                batch_size = len(labels_)
-                cnt += batch_size
-
-                labels = torch.LongTensor(labels_).view(-1)
-                labels = torch.unsqueeze(labels, 1)
-                #labels = Variable(labels, requires_grad=False).cuda()
-                labels = Variable(labels, requires_grad=False)
-
-                onehot = torch.FloatTensor(batch_size, self.num_cat)
-                onehot.zero_()
-                onehot.scatter_(1, labels.data.cpu(), 1)
-                #onehot = Variable(onehot, requires_grad=False).cuda()
-                onehot = Variable(onehot, requires_grad=False)
-                
-
-                if which_round == 0:
-                    logits = self.en2de(onehot)
-                elif which_round == 1:
-                    logits = self.de2en(onehot)
-                elif which_round == 2:
-                    logits = self.en2de2en(onehot)
-
-                for prec_idx, k in enumerate(ks):
-                    right, total = logit_to_top_k(logits, labels, k)
-                    acc[prec_idx][0] += right
-                    acc[prec_idx][1] += total
-            assert( cnt == len(keys) )
-            assert( acc[0][1] == len(keys) )
-
-            pm = round_
-            for prec_idx, k in enumerate(ks):
-                curr_acc = float(acc[prec_idx][0]) / acc[prec_idx][1] * 100
-                result.append( curr_acc )
-                pm += "| P@{} {:.2f}% ".format(k, curr_acc )
-            print (pm)
-
-        return result
+    def l22en(self, src):
+        trg = self.l2_agent.translate(src)
+        return trg
 
 class Agent(torch.nn.Module):
     def __init__(self, native, foreign, args):
+        # vocab_size, num_layers, num_directions, i2w, w2i : 2 separate arguments
         super(Agent, self).__init__()
         if args.no_share_bhd:
             print ("Not sharing visual system for each agent.")
-            self.beholder1 = Beholder(args.D_img, args.D_hid, args.dropout)
-            self.beholder2 = Beholder(args.D_img, args.D_hid, args.dropout)
+            self.beholder1 = Beholder(args)
+            self.beholder2 = Beholder(args)
         else:
             print ("Sharing visual system for each agent.")
-            self.beholder = Beholder(args.D_img, args.D_hid, args.dropout)
+            self.beholder  = Beholder(args)
 
-        self.speaker = Speaker(native, foreign, args.D_hid, args.num_cat, args.dropout, args.temp, args.hard, args.tt)
-        self.listener = Listener(native, foreign, args.D_hid, args.num_cat, args.dropout)
+        self.speaker = Speaker(native, args)
+        self.listener = RnnListener(foreign, args)
+        self.tt = torch if args.cpu else torch.cuda
+        self.native, self.foreign = native, foreign
+        self.i2w, self.w2i = args.i2w, args.w2i
+        self.unit_norm = args.unit_norm
 
-    def forward():
-        return
+        self.beam_width = args.beam_width
+        self.norm_pow = args.norm_pow
 
-    def translate(self, comm_onehot):
-        lsn_emb_msg = self.listener.emb(comm_onehot) # (batch_size, D_hid)
-        spk_logits = self.speaker.hid_to_cat(lsn_emb_msg) # (batch_size, num_cat)
-        return spk_logits
+        self.D_hid = args.D_hid
+
+    def forward(self, src_caps_in, src_caps_in_lens, trg_sorted_idx, trg_caps_in, trg_caps_in_lens):
+        enc_hid = self.listener(src_caps_in, src_caps_in_lens) # (batch_size, D_hid)
+        enc_hid = torch.index_select(enc_hid, 0, trg_sorted_idx)
+        dec_logits, _ = self.speaker(enc_hid, trg_caps_in, trg_caps_in_lens, "gumbel")
+        return dec_logits
+
+    def translate(self, src, decode_how="beam"):
+        # src : (batch_size, seq_len)
+        batch_size = len(src)
+        src_lens = [len(src_i) for src_i in src]
+        seq_len = max(src_lens)
+
+        src = np.array( [ np.lib.pad( src_i, (0, seq_len - len(src_i) ), 'constant', constant_values=(0,0) ) for src_i in src ] )
+        src = Variable( self.tt.LongTensor( src ), requires_grad=False ) # (batch_size, seq_len)
+
+        concept = self.listener(src, src_lens) # (batch_size, D_hid)
+        if self.unit_norm:
+            norm = torch.norm(concept, 2, 1, keepdim=True).expand_as(concept).detach() + 1e-9
+            concept = concept / norm
+
+        if decode_how == "beam":
+            gen_idx = self.speaker.beam_search(concept, self.beam_width, self.norm_pow)
+        elif decode_how == "greedy":
+            gen_idx = self.speaker.sample(concept, True)
+
+        trg = decode(gen_idx, self.i2w[self.native])
+        return trg
 
 class Beholder(torch.nn.Module):
-    def __init__(self, D_img, D_hid, dropout):
+    def __init__(self, args):
         super(Beholder, self).__init__()
-        self.img_to_hid = torch.nn.Linear(D_img, D_hid) # shared visual system
-        self.drop = torch.nn.Dropout(p=dropout)
+        self.img_to_hid = torch.nn.Linear(args.D_img, args.D_hid) # shared visual system
+        self.unit_norm = args.unit_norm
+        self.drop = nn.Dropout(p=args.dropout)
+        self.two_fc = args.two_fc
+        if self.two_fc:
+            self.hid_to_hid = torch.nn.Linear(args.D_hid, args.D_hid)
 
     def forward(self, img):
-        img = self.drop(img)
-        h_img = self.img_to_hid(img)
+        h_img = img
+
+        h_img = self.img_to_hid(h_img)
+
+        h_img = self.drop(h_img)
+
+        if self.two_fc:
+            h_img = self.hid_to_hid( F.relu( h_img ) )
+
+        if self.unit_norm:
+            #norm = torch.norm(h_img, p=2, dim=1) + 1e-9
+            norm = torch.norm(h_img, p=2, dim=1, keepdim=True).detach() + 1e-9
+            h_img = h_img / norm.expand_as(h_img)
         return h_img
 
+class RnnListener(torch.nn.Module):
+    def __init__(self, lang, args):
+        super(RnnListener, self).__init__()
+        self.rnn = nn.GRU(args.D_emb, args.D_hid, args.num_layers['lsn'][lang], batch_first=True) if args.num_directions['lsn'][lang] == 1 else \
+                   nn.GRU(args.D_emb, args.D_hid, args.num_layers['lsn'][lang], batch_first=True, bidirectional=True)
+        self.emb = nn.Embedding(args.vocab_size[lang], args.D_emb, padding_idx=0)
+        self.hid_to_hid = nn.Linear(args.num_directions['lsn'][lang] * args.D_hid, args.D_hid)
+        self.drop = nn.Dropout(p=args.dropout)
+
+        self.D_hid = args.D_hid
+        self.D_emb = args.D_emb
+        self.num_layers = args.num_layers['lsn'][lang]
+        self.num_directions = args.num_directions['lsn'][lang]
+        self.vocab_size = args.vocab_size[lang]
+        self.i2w = args.i2w[lang]
+        self.w2i = args.w2i[lang]
+        self.unit_norm = args.unit_norm
+
+        self.tt = torch if args.cpu else torch.cuda
+
+    def forward(self, spk_msg, spk_msg_lens):
+        # spk_msg : (batch_size, seq_len)
+        # spk_msg_lens : (batch_size)
+        batch_size = spk_msg.size()[0]
+        seq_len = spk_msg.size()[1]
+
+        h_0 = Variable( self.tt.FloatTensor(self.num_layers * self.num_directions, batch_size, self.D_hid).zero_() )
+        spk_msg_emb = self.emb(spk_msg) # (batch_size, seq_length, D_emb)
+        spk_msg_emb = self.drop(spk_msg_emb)
+
+        pack = torch.nn.utils.rnn.pack_padded_sequence(spk_msg_emb, spk_msg_lens, batch_first=True)
+
+        # input (batch_size, seq_len, D_emb)
+        # h_0 (num_layers * num_directions, batch_size, D_hid)
+        _, h_n = self.rnn(pack, h_0)
+        # output (batch_size, seq_len, D_hid * num_directions)
+        # h_n (num_layers * num_directions, batch_size, D_hid)
+
+        h_n = h_n[-self.num_directions:,:,:]
+        out = h_n.transpose(0,1).contiguous().view(batch_size, self.num_directions * self.D_hid)
+        # out (batch_size, num_layers * num_directions * D_hid)
+        out = self.hid_to_hid( out )
+        #out = self.hid_to_hid( out )
+        # out (batch_size, D_hid)
+
+        if self.unit_norm:
+            #norm = torch.norm(out, p=2, dim=1) + 1e-9
+            norm = torch.norm(out, p=2, dim=1, keepdim=True).detach() + 1e-9
+            out = out / norm.expand_as(out)
+
+        return out
+
 class Speaker(torch.nn.Module):
-    def __init__(self, native, foreign, D_hid, num_cat, dropout, temp, hard, tt):
+    def __init__(self, lang, args):
         super(Speaker, self).__init__()
-        self.hid_to_cat = torch.nn.Linear(D_hid, num_cat, bias=False) # Speaker
-        self.drop = torch.nn.Dropout(p=dropout)
-        self.num_cat = num_cat
-        self.temp = temp
-        self.hard = hard
-        self.tt = tt
-        self.native, self.foreign = native, foreign
+        self.rnn = nn.GRU(args.D_emb, args.D_hid, args.num_layers['spk'][lang], batch_first=True)
+        self.emb = nn.Embedding(args.vocab_size[lang], args.D_emb, padding_idx=0)
+        self.hid_to_voc = nn.Linear(args.D_hid, args.vocab_size[lang])
 
-    def forward(self, h_img):
-        #h_img = self.drop(h_img)
-        spk_logits = self.hid_to_cat(h_img) # (batch_size, num_cat)
-        comm_onehot, comm_label = gumbel_softmax(spk_logits, temp=self.temp, hard=self.hard, tt=self.tt) # (batch_size, num_cat)
-        logits_grad = spk_logits.grad
-        output_grad = comm_onehot.grad
-        # print(self.num_cat) = 468
-        return spk_logits, comm_onehot, comm_label
+        self.D_emb = args.D_emb
+        self.D_hid = args.D_hid
+        self.num_layers = args.num_layers['spk'][lang]
+        self.drop = nn.Dropout(p=args.dropout)
 
-    def nn_words(self, batch_size = 5):
-        word_idx = np.random.randint(0, self.num_cat, size=batch_size)
-        for idx in word_idx:
-            self.compute_dot_for_all(idx)
+        self.vocab_size = args.vocab_size[lang]
+        self.i2w = args.i2w[lang]
+        self.w2i = args.w2i[lang]
 
-    def compute_dot_for_all(self, idx):
-        l1_dic = get_idx_to_cat(self.native)
-        assert len(l1_dic) == self.num_cat
+        self.temp = args.temp
+        self.hard = args.hard
+        self.tt = torch if args.cpu else torch.cuda
+        self.seq_len = args.seq_len[lang]
 
-        emb = torch.FloatTensor(self.hid_to_cat.weight.data.cpu()) # [num_cat, D_hid]
-        vec = emb[idx] # [1, D_hid]
+    def forward(self, h_img, caps_in, caps_in_lens, sample_how):
+        # h_img : (batch_size, D_hid)
+        # caps_in : (batch_size, seq_len)
+        # caps_in_lens : (batch_size)
+        batch_size = caps_in.size()[0]
+        seq_len = caps_in.size()[1]
 
-        vec_exp = torch.unsqueeze(vec,0).expand(emb.size()) # (num_cat, D_hid)
-        prod = torch.mul(vec_exp, emb) # [num_cat, D_hid]
-        prod = torch.sum(prod, 1) # [num_cat]
-        norm1 = torch.norm(vec_exp, 2, 1) # [num_cat]
-        norm2 = torch.norm(emb, 2, 1) # (num_cat)
-        norm = torch.mul(norm1, norm2) # [num_cat]
+        h_img = h_img.view(1, batch_size, self.D_hid).repeat(self.num_layers, 1, 1)
+        caps_in_emb = self.emb(caps_in) # (batch_size, seq_length, D_emb)
+        caps_in_emb = self.drop(caps_in_emb)
 
-        ans = prod / norm
-        ans = ans.view(self.num_cat)
+        pack = torch.nn.utils.rnn.pack_padded_sequence(caps_in_emb, caps_in_lens, batch_first=True)
 
-        logits_sorted, indices = torch.sort(ans, dim=0, descending=True)
-        indices = indices[:5].cpu().numpy()
+        # input (batch_size, seq_len, D_emb)
+        # h0 (num_layers, batch_size, D_hid)
+        output, _ = self.rnn(pack, h_img)
+        # output (batch_size, seq_len, D_hid)
+        # hn (num_layers, batch_size, D_hid)
+        output_data = output.data
+        logits = self.hid_to_voc( output_data )
 
-        print ("{} -> {}".format(l1_dic[idx], ", ".join(["{} ({:.2f})".format(l1_dic[idx1], ans[idx1]) for idx1 in indices])))
+        unpacked, _ = torch.nn.utils.rnn.pad_packed_sequence(output, batch_first=True)
+        # unpacked (batch_size, seq_len, D_hid)
+        unpacked_logits = self.hid_to_voc( unpacked.contiguous().view(-1, self.D_hid) )
+        # unpacked (batch_size * seq_len, vocab_size)
 
-class Listener(torch.nn.Module):
-    def __init__(self, native, foreign, D_hid, num_cat, dropout):
-        super(Listener, self).__init__()
-        self.emb = torch.nn.Linear(num_cat, D_hid, bias=False)
+        if sample_how == "argmax":
+            _, comm_label = torch.max(unpacked_logits, 1)
+        elif sample_how == "gumbel":
+            _, comm_label = gumbel_softmax(unpacked_logits, self.temp, self.hard, self.tt) # (batch_size, num_cat)
 
-        self.D_hid = D_hid
-        self.num_cat = num_cat
-        self.native, self.foreign = native, foreign
+        comm_label = comm_label.view(batch_size, seq_len)
+        len_scat = [range(x) + [0] * (seq_len - x) for x in caps_in_lens]
+        mask = Variable( self.tt.LongTensor(batch_size, seq_len).zero_().scatter_(1, self.tt.LongTensor(len_scat), 1) )
+        comm_label = comm_label * mask
 
-    def forward(self, lsn_h_imgs, comm_onehot):
-        # lsn_h_imgs : (batch_size, num_dist, D_hid)
-        # comm_onehot : (batch_size, num_cat)
-        num_dist = lsn_h_imgs.size()[1]
-        lsn_hid_msg = self.emb(comm_onehot) # (batch_size, D_hid)
+        return logits, comm_label
 
-        lsn_hid_msg = lsn_hid_msg.unsqueeze(1).repeat(1, num_dist, 1)
-        lsn_hid_msg = lsn_hid_msg.view(-1, num_dist, self.D_hid) # (batch_size, num_dist, D_hid)
+    def sample(self, h_img, argmax):
+        batch_size = h_img.size()[0]
+        start = [self.w2i[ "<BOS>" ] for ii in range(batch_size)]
+        gen_idx = [[] for ii in range(batch_size)]
+        done = np.array( [False for ii in range(batch_size)] )
 
-        diff = torch.pow( lsn_hid_msg - lsn_h_imgs, 2)
-        diff = torch.mean( diff, 2 ) # (batch_size, num_dist)
-        diff = 1 / (diff + 1e-10)
-        diff = diff.squeeze()
+        # h_img : (batch_size, D_hid)
+        h_img = h_img.unsqueeze(0).view(1, -1, self.D_hid).repeat(self.num_layers, 1, 1)
+        # hid : (num_layers, batch_size, D_hid)
+        hid = h_img
+        ft = self.tt.LongTensor(start).view(-1).unsqueeze(1) # (batch_size, 1)
+        input = self.emb( Variable( ft ) ) # (batch_size, D_emb)
 
-        return diff # (batch_size, num_dist)
+        for idx in range(self.seq_len):
+            output, hid = self.rnn( input, hid )
 
-    def nn_words(self, batch_size = 5):
-        word_idx = np.random.randint(0, self.num_cat, size=batch_size)
-        for idx in word_idx:
-            self.compute_dot_for_all(idx)
+            output = output.view(-1, self.D_hid)
+            output = self.hid_to_voc( output )
+            output = output.view(-1, self.vocab_size)
 
-    def compute_dot_for_all(self, idx):
-        l1_dic = bergsma_words(self.foreign)
-        #assert len(l1_dic) == self.num_cat
+            if argmax:
+                topv, topi = output.data.topk(1)
+                # topi (batch_size, 1)
+                top1 = topi.view(-1).cpu().numpy()
+            else:
+                top1 = torch.multinomial(output, 1).cpu().data.numpy()
 
-        emb = torch.FloatTensor(torch.t(self.emb.weight.data.cpu())) # [num_cat, D_hid]
-        vec = emb[idx] # [1, D_hid]
+            for ii in range(batch_size):
+                if self.i2w[ top1[ii] ] == "<EOS>":
+                    done[ii] = True
+                if not done[ii]:
+                    gen_idx[ii].append( top1[ii] )
 
-        vec_exp = torch.unsqueeze(vec,0).expand(emb.size()) # (num_cat, D_hid)
-        prod = torch.mul(vec_exp, emb) # [num_cat, D_hid]
-        prod = torch.sum(prod, 1) # [num_cat]
-        norm1 = torch.norm(vec_exp, 2, 1) # [num_cat]
-        norm2 = torch.norm(emb, 2, 1) # (num_cat)
-        norm = torch.mul(norm1, norm2) # [num_cat]
+            if np.array_equal( done, np.array( [True for x in range(batch_size) ] ) ):
+                break
 
-        ans = prod / norm
-        ans = ans.view(-1)
+            input = self.emb( Variable( topi ) )
 
-        logits_sorted, indices = torch.sort(ans, dim=0, descending=True)
-        indices = indices[:5].cpu().numpy()
+        return gen_idx
 
-        print ("{} -> {}".format(l1_dic[idx], ", ".join(["{} ({:.2f})".format(l1_dic[idx1], ans[idx1]) for idx1 in indices])))
+    def beam_search(self, h_ctx, width, norm_pow): # # out (batch_size, D_hid)
+        voc_size, batch_size = self.vocab_size, h_ctx.size()[0]
+        live = [ [ ( 0.0, [ self.w2i[ "<BOS>" ] ], 0 ) ] for ii in range(batch_size) ]
+        dead = [ [] for ii in range(batch_size) ]
+        num_dead = [0 for ii in range(batch_size)]
+
+        ft = self.tt.LongTensor( [ self.w2i[ "<BOS>" ] for ii in range(batch_size) ] )[:,None]
+        input = self.emb( Variable( ft ) ) # (batch_size, 1, D_emb)
+
+        #hid = h_ctx.view(batch_size, self.num_layers, self.D_hid).transpose(0,1)\
+        #        .contiguous()
+        hid = h_ctx[None,:,:].repeat(self.num_layers, 1, 1) # hid : (num_layers, batch_size, D_hid)
+
+        for tidx in range(self.seq_len):
+            # input (batch_size * width, 1, D_emb)
+            # h_0 (num_layers, batch_size * width, D_hid)
+            output, hid = self.rnn( input, hid )
+            # output (batch_size * width, 1, D_hid)
+            # h_n (num_layers, batch_size * width, D_hid)
+
+            cur_prob = F.log_softmax( self.hid_to_voc( output.view(-1, self.D_hid) ))\
+                    .view(batch_size, -1, voc_size).data # (batch_size, width, vocab_size)
+            pre_prob = self.tt.FloatTensor( [ [ x[0] for x in ee ] for ee in live ] ).view(batch_size, -1, 1) \
+                    # (batch_size, width, 1)
+            total_prob = cur_prob + pre_prob # (batch_size, width, voc_size)
+            total_prob = total_prob.view(batch_size, -1)
+
+            _, topi_s = total_prob.topk( width, dim=1)
+            topv_s = cur_prob.view(batch_size, -1).gather(1, topi_s)
+            # (batch_size, width)
+
+            new_live = [ [] for ii in range(batch_size) ]
+            for bidx in range(batch_size):
+                num_live = width - num_dead[bidx]
+                if num_live > 0:
+                    tis = topi_s[bidx][:num_live]
+                    tvs = topv_s[bidx][:num_live]
+                    for eidx, (topi, topv) in enumerate(zip(tis, tvs)): # NOTE max width times
+                        if topi % voc_size == self.w2i[ "<EOS>" ] :
+                            dead[bidx].append( (  live[bidx][ topi / voc_size ][0] + topv, \
+                                                  live[bidx][ topi / voc_size ][1] + [ topi % voc_size ],\
+                                                  topi) )
+                            num_dead[bidx] += 1
+                        else:
+                            new_live[bidx].append( (    live[bidx][ topi / voc_size ][0] + topv, \
+                                                        live[bidx][ topi / voc_size ][1] + [ topi % voc_size ],\
+                                                        topi) )
+                while len(new_live[bidx]) < width:
+                    new_live[bidx].append( (    -99999999, \
+                                                [0],\
+                                                0) )
+            live = new_live
+
+            if num_dead == [width for ii in range(batch_size)]:
+                break
+
+            in_vocab_idx = [ [ x[2] % voc_size for x in ee ] for ee in live ] # NOTE batch_size first
+            input = self.emb( Variable( self.tt.LongTensor( in_vocab_idx ) ).view(-1) ).view(-1, 1, self.D_emb) \
+                    # input (batch_size * width, 1, D_emb)
+
+            bb = 1 if tidx == 0 else width
+            in_width_idx = [ [ x[2] / voc_size + bbidx * bb for x in ee ] for bbidx, ee in enumerate(live) ] \
+                    # live : (batch_size, width)
+            hid = hid.index_select( 1, Variable( self.tt.LongTensor( in_width_idx ).view(-1) ) ).\
+                    view(self.num_layers, -1, self.D_hid)
+            # h_0 (num_layers, batch_size * width, D_hid)
+
+        for bidx in range(batch_size):
+            if num_dead[bidx] < width:
+                for didx in range( width - num_dead[bidx] ):
+                    (a, b, c) = live[bidx][didx]
+                    dead[bidx].append( (a, b, c)  )
+
+        #dead_ = [ [ ( float(a) / ( float( math.pow(5+len(b), norm_pow) ) / math.pow(5+1, norm_pow) ) , b, c) for (a,b,c) in ee] for ee in dead]
+        dead_ = [ [ ( float(a) / math.pow(len(b), norm_pow) , b, c) for (a,b,c) in ee] for ee in dead]
+        ans = []
+        for dd_ in dead_:
+            dd = sorted( dd_, key=operator.itemgetter(0), reverse=True )
+            ans.append( dd[0][1][1:-1] )
+        return ans
 
